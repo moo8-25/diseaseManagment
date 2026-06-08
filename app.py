@@ -1,6 +1,6 @@
 """
-RAG System Deployment on Railway
-FastAPI + FAISS + Sentence Transformers
+Plant Disease RAG System - Railway Deployment
+Fixed JSON serialization issue
 """
 
 import os
@@ -9,48 +9,66 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 import pickle
-import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import List, Optional
 import uvicorn
 from datetime import datetime
 
+app = FastAPI(title="Plant Disease RAG API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ============================================
-# RAG SYSTEM CLASS
+# RAG SYSTEM
 # ============================================
 
 class PlantDiseaseRAG:
-    def __init__(self, model_dir: str = "rag_models"):
-        self.model_dir = model_dir
-        os.makedirs(model_dir, exist_ok=True)
-        
-        self.faiss_path = os.path.join(model_dir, "faiss_index.bin")
-        self.documents_path = os.path.join(model_dir, "documents.pkl")
-        
+    def __init__(self):
         self.index = None
         self.documents = None
         self.embedding_model = None
-        
-        # Try to load existing models
-        if not self.load_models():
-            print("No models found. Building from CSV...")
-            self.build("disease_management.csv")
+        self.load_or_build()
     
-    def build(self, csv_path: str):
-        """Build FAISS index from CSV"""
-        print("Building RAG models...")
+    def load_or_build(self):
+        """Load existing models or build from CSV"""
+        base_dir = os.path.dirname(__file__)
+        index_path = os.path.join(base_dir, "faiss_index.bin")
+        docs_path = os.path.join(base_dir, "documents.pkl")
+        csv_path = os.path.join(base_dir, "disease_management.csv")
         
-        # Load data
+        if os.path.exists(index_path) and os.path.exists(docs_path):
+            print("Loading existing models...")
+            self.index = faiss.read_index(index_path)
+            with open(docs_path, "rb") as f:
+                self.documents = pickle.load(f)
+            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            print(f"✅ Loaded {len(self.documents)} diseases")
+        elif os.path.exists(csv_path):
+            print("Building from CSV...")
+            self.build_from_csv(csv_path)
+        else:
+            print(f"ERROR: No CSV found at {csv_path}")
+    
+    def build_from_csv(self, csv_path):
+        """Build FAISS index from CSV"""
+        print(f"Reading CSV from: {csv_path}")
         self.df = pd.read_csv(csv_path)
+        print(f"Loaded {len(self.df)} rows")
+        
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
         # Prepare documents
         self.documents = []
         for _, row in self.df.iterrows():
             doc = {
-                "disease_code": row['disease_code'],
                 "disease_name": row['disease_name'],
                 "crop": row['crop'],
                 "chemical": row['chemical_control'],
@@ -59,14 +77,7 @@ class PlantDiseaseRAG:
                 "cultural": row['cultural_practices'],
                 "severity": row['severity'],
                 "urgency": row['treatment_urgency'],
-                "text": f"""
-                DISEASE: {row['disease_name']}
-                CROP: {row['crop']}
-                SEVERITY: {row['severity']}
-                CHEMICAL: {row['chemical_control']}
-                ORGANIC: {row['organic_control']}
-                PREVENTION: {row['prevention']}
-                """
+                "text": f"Disease: {row['disease_name']}. Chemical: {row['chemical_control']}. Organic: {row['organic_control']}"
             }
             self.documents.append(doc)
         
@@ -79,233 +90,107 @@ class PlantDiseaseRAG:
         self.index.add(embeddings)
         
         # Save models
-        self.save_models()
-        print(f"✅ Built: {len(self.documents)} diseases indexed")
-    
-    def save_models(self):
-        """Save models to disk"""
-        faiss.write_index(self.index, self.faiss_path)
-        with open(self.documents_path, 'wb') as f:
+        faiss.write_index(self.index, os.path.join(os.path.dirname(csv_path), "faiss_index.bin"))
+        with open(os.path.join(os.path.dirname(csv_path), "documents.pkl"), "wb") as f:
             pickle.dump(self.documents, f)
-        print("✅ Models saved")
-    
-    def load_models(self) -> bool:
-        """Load models from disk"""
-        if not os.path.exists(self.faiss_path) or not os.path.exists(self.documents_path):
-            return False
         
-        try:
-            self.index = faiss.read_index(self.faiss_path)
-            with open(self.documents_path, 'rb') as f:
-                self.documents = pickle.load(f)
-            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            print(f"✅ Loaded {len(self.documents)} diseases")
-            return True
-        except Exception as e:
-            print(f"Error loading: {e}")
-            return False
-    
-    def retrieve(self, query: str, k: int = 1) -> dict:
-        """Retrieve most relevant disease"""
-        query_vec = self.embedding_model.encode([query])
-        query_vec = np.array(query_vec).astype('float32')
-        
-        distances, indices = self.index.search(query_vec, k)
-        
-        if indices[0][0] == -1:
-            return None
-        
-        similarity = 1 / (1 + distances[0][0])
-        return {
-            "disease": self.documents[indices[0][0]],
-            "similarity": similarity
-        }
+        print(f"✅ Built with {len(self.documents)} diseases")
     
     def query(self, disease_name: str) -> dict:
-        """Query RAG system"""
-        result = self.retrieve(disease_name)
+        """Query the RAG system - returns JSON serializable types"""
+        if self.index is None:
+            return {"success": False, "message": "Models not loaded"}
         
-        if not result or result['similarity'] < 0.4:
+        try:
+            # Embed query
+            query_vec = self.embedding_model.encode([disease_name])
+            query_vec = np.array(query_vec).astype('float32')
+            
+            # Search
+            distances, indices = self.index.search(query_vec, 1)
+            
+            if indices[0][0] == -1:
+                return {"success": False, "message": "No matching disease found"}
+            
+            # Convert numpy types to Python native types
+            similarity = float(1 / (1 + distances[0][0]))
+            disease = self.documents[indices[0][0]]
+            
             return {
-                "success": False,
-                "message": f"Disease '{disease_name}' not found with high confidence",
-                "suggestions": self.get_suggestions(disease_name)
+                "success": True,
+                "confidence": similarity,
+                "disease_name": str(disease['disease_name']),
+                "crop": str(disease['crop']),
+                "severity": str(disease['severity']),
+                "urgency": str(disease['urgency']),
+                "chemical_control": str(disease['chemical']),
+                "organic_control": str(disease['organic']),
+                "prevention": str(disease['prevention']),
+                "cultural_practices": str(disease['cultural'])
             }
-        
-        disease = result['disease']
-        return {
-            "success": True,
-            "confidence": result['similarity'],
-            "disease_name": disease['disease_name'],
-            "crop": disease['crop'],
-            "severity": disease['severity'],
-            "urgency": disease['urgency'],
-            "chemical_control": disease['chemical'],
-            "organic_control": disease['organic'],
-            "prevention": disease['prevention'],
-            "cultural_practices": disease['cultural']
-        }
-    
-    def get_suggestions(self, query: str, limit: int = 5) -> List[str]:
-        """Get disease suggestions"""
-        suggestions = []
-        for doc in self.documents:
-            if query.lower() in doc['disease_name'].lower() or query.lower() in doc['crop'].lower():
-                suggestions.append(doc['disease_name'])
-                if len(suggestions) >= limit:
-                    break
-        return suggestions
+        except Exception as e:
+            return {"success": False, "message": f"Query error: {str(e)}"}
     
     def get_all_diseases(self) -> List[dict]:
         """Get all diseases"""
+        if self.documents is None:
+            return []
         return [
             {
-                "disease_name": doc['disease_name'],
-                "crop": doc['crop'],
-                "severity": doc['severity']
-            }
-            for doc in self.documents
+                "disease_name": str(d['disease_name']),
+                "crop": str(d['crop']),
+                "severity": str(d['severity'])
+            } 
+            for d in self.documents
         ]
 
-
-# ============================================
-# FASTAPI APP
-# ============================================
-
-app = FastAPI(
-    title="🌱 Plant Disease RAG System API",
-    description="Retrieval-Augmented Generation for Plant Disease Management",
-    version="1.0.0"
-)
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize RAG system
+# Initialize RAG
+print("Initializing RAG system...")
 rag = PlantDiseaseRAG()
-
-# Request/Response Models
-class DiseaseQuery(BaseModel):
-    disease_name: str
-
-class DiseaseResponse(BaseModel):
-    success: bool
-    message: Optional[str] = None
-    confidence: Optional[float] = None
-    disease_name: Optional[str] = None
-    crop: Optional[str] = None
-    severity: Optional[str] = None
-    urgency: Optional[str] = None
-    chemical_control: Optional[str] = None
-    organic_control: Optional[str] = None
-    prevention: Optional[str] = None
-    cultural_practices: Optional[str] = None
-    suggestions: Optional[List[str]] = None
-
+print(f"RAG initialized: index={rag.index is not None}, docs={len(rag.documents) if rag.documents else 0}")
 
 # ============================================
 # API ENDPOINTS
 # ============================================
 
+class DiseaseQuery(BaseModel):
+    disease_name: str
+
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
-        "service": "🌱 Plant Disease RAG System",
+        "service": "Plant Disease RAG System",
         "status": "running",
-        "version": "1.0.0",
-        "endpoints": {
-            "GET /": "This info",
-            "GET /health": "Health check",
-            "GET /diseases": "List all diseases",
-            "POST /query": "Query disease management",
-            "GET /disease/{name}": "Get disease by name"
-        }
+        "models_loaded": rag.index is not None,
+        "diseases_loaded": len(rag.documents) if rag.documents else 0
     }
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
+async def health():
     return {
         "status": "healthy",
         "models_loaded": rag.index is not None,
-        "total_diseases": len(rag.documents) if rag.documents else 0,
+        "diseases_loaded": len(rag.documents) if rag.documents else 0,
         "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/diseases")
-async def get_all_diseases(limit: int = 100, crop: Optional[str] = None):
-    """Get all diseases with optional filtering"""
+async def get_diseases():
     diseases = rag.get_all_diseases()
-    
-    if crop:
-        diseases = [d for d in diseases if d['crop'].lower() == crop.lower()]
-    
-    return {
-        "total": len(diseases),
-        "diseases": diseases[:limit]
-    }
-
-@app.get("/disease/{disease_name}")
-async def get_disease_by_name(disease_name: str):
-    """Get management plan for a disease"""
-    result = rag.query(disease_name)
-    
-    if not result['success']:
-        raise HTTPException(status_code=404, detail=result['message'])
-    
-    return result
+    return {"total": len(diseases), "diseases": diseases}
 
 @app.post("/query")
 async def query_disease(query: DiseaseQuery):
-    """Query disease management (POST method)"""
     result = rag.query(query.disease_name)
-    
-    if not result['success']:
-        raise HTTPException(status_code=404, detail=result['message'])
-    
+    if not result.get('success', False):
+        raise HTTPException(status_code=404, detail=result.get('message', 'Disease not found'))
     return result
 
 @app.get("/search")
-async def search_diseases(q: str):
-    """Search for diseases"""
-    suggestions = rag.get_suggestions(q)
-    return {
-        "query": q,
-        "results": suggestions,
-        "count": len(suggestions)
-    }
-
-@app.get("/stats")
-async def get_stats():
-    """Get system statistics"""
+async def search(q: str):
     diseases = rag.get_all_diseases()
-    severity_counts = {}
-    crop_counts = {}
-    
-    for d in diseases:
-        severity = d['severity']
-        crop = d['crop']
-        severity_counts[severity] = severity_counts.get(severity, 0) + 1
-        crop_counts[crop] = crop_counts.get(crop, 0) + 1
-    
-    return {
-        "total_diseases": len(diseases),
-        "severity_distribution": severity_counts,
-        "crop_distribution": crop_counts,
-        "models_loaded": rag.index is not None
-    }
-
-
-# ============================================
-# FOR LOCAL DEVELOPMENT
-# ============================================
+    matches = [d for d in diseases if q.lower() in d['disease_name'].lower()]
+    return {"query": q, "results": matches[:10], "count": len(matches)}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
