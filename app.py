@@ -1,7 +1,6 @@
 """
-REAL RAG SYSTEM: Disease Name → LLM Generated Treatment
-- FAISS retrieves relevant disease info
-- Groq Llama 3 generates custom treatment plan
+REAL RAG SYSTEM - Disease Name → LLM Generated Treatment
+Fixed 500 error
 """
 
 import os
@@ -17,7 +16,7 @@ from typing import List, Optional
 import uvicorn
 from groq import Groq
 
-app = FastAPI(title="Plant Disease RAG API - Real Generation", version="3.0")
+app = FastAPI(title="Plant Disease RAG API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +27,7 @@ app.add_middleware(
 )
 
 # ============================================
-# REAL RAG SYSTEM WITH GENERATION
+# RAG SYSTEM WITH GROQ
 # ============================================
 
 class PlantDiseaseRAG:
@@ -40,11 +39,15 @@ class PlantDiseaseRAG:
         
         # Initialize Groq if API key available
         groq_api_key = os.environ.get("GROQ_API_KEY")
-        if groq_api_key:
-            self.groq_client = Groq(api_key=groq_api_key)
-            print("✅ Groq LLM enabled")
+        if groq_api_key and groq_api_key != "":
+            try:
+                self.groq_client = Groq(api_key=groq_api_key)
+                print("✅ Groq LLM enabled")
+            except Exception as e:
+                print(f"⚠️ Groq init error: {e}")
+                self.groq_client = None
         else:
-            print("⚠️ GROQ_API_KEY not set - will use template fallback")
+            print("⚠️ GROQ_API_KEY not set - using template mode")
         
         self.load_or_build()
     
@@ -76,34 +79,22 @@ class PlantDiseaseRAG:
         
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Prepare rich documents with ALL treatment info
+        # Prepare documents
         self.documents = []
         for _, row in self.df.iterrows():
-            # Create a rich text document for retrieval
-            rich_text = f"""
-DISEASE: {row['disease_name']}
-CROP: {row['crop']}
-SEVERITY: {row['severity']}
-SYMPTOMS: {row['symptoms']}
-CHEMICAL CONTROL: {row['chemical_control']}
-ORGANIC CONTROL: {row['organic_control']}
-PREVENTION: {row['prevention']}
-CULTURAL PRACTICES: {row['cultural_practices']}
-URGENCY: {row['treatment_urgency']}
-"""
             doc = {
-                "disease_code": row['disease_code'],
-                "disease_name": row['disease_name'],
-                "crop": row['crop'],
-                "severity": row['severity'],
-                "symptoms": row['symptoms'],
-                "chemical_control": row['chemical_control'],
-                "organic_control": row['organic_control'],
-                "prevention": row['prevention'],
-                "cultural_practices": row['cultural_practices'],
-                "urgency": row['treatment_urgency'],
-                "action_required": row['action_required'],
-                "text": rich_text
+                "disease_code": str(row['disease_code']),
+                "disease_name": str(row['disease_name']),
+                "crop": str(row['crop']),
+                "severity": str(row['severity']),
+                "symptoms": str(row['symptoms']),
+                "chemical_control": str(row['chemical_control']),
+                "organic_control": str(row['organic_control']),
+                "prevention": str(row['prevention']),
+                "cultural_practices": str(row['cultural_practices']),
+                "urgency": str(row['treatment_urgency']),
+                "action_required": str(row['action_required']),
+                "text": f"{row['disease_name']} {row['crop']} {row['symptoms']} {row['chemical_control']}"
             }
             self.documents.append(doc)
         
@@ -122,68 +113,41 @@ URGENCY: {row['treatment_urgency']}
         
         print(f"✅ Built with {len(self.documents)} diseases")
     
-    def retrieve(self, disease_name: str, top_k: int = 2) -> List[dict]:
-        """Retrieve most relevant disease documents"""
-        
-        # First try exact match on disease_code
+    def get_disease_by_name(self, disease_name: str):
+        """Find disease by code or name"""
+        # Exact match on disease_code
         for doc in self.documents:
             if doc['disease_code'].lower() == disease_name.lower():
-                return [doc]
+                return doc, 1.0
         
-        # Then FAISS similarity search
-        query_vec = self.embedding_model.encode([disease_name])
-        query_vec = np.array(query_vec).astype('float32')
-        distances, indices = self.index.search(query_vec, top_k)
+        # Exact match on disease_name
+        for doc in self.documents:
+            if doc['disease_name'].lower() == disease_name.lower():
+                return doc, 0.95
         
-        results = []
-        for i, idx in enumerate(indices[0]):
-            if idx != -1:
-                similarity = 1 / (1 + distances[0][i])
-                results.append({
-                    "document": self.documents[idx],
-                    "similarity": similarity,
-                    "rank": i + 1
-                })
+        # FAISS similarity search
+        try:
+            query_vec = self.embedding_model.encode([disease_name])
+            query_vec = np.array(query_vec).astype('float32')
+            distances, indices = self.index.search(query_vec, 1)
+            
+            if indices[0][0] != -1:
+                similarity = float(1 / (1 + distances[0][0]))
+                doc = self.documents[indices[0][0]]
+                return doc, similarity
+        except Exception as e:
+            print(f"Search error: {e}")
         
-        return results
+        return None, 0
     
-    def generate_treatment(self, disease_name: str, retrieved_docs: List) -> str:
-        """GENERATION: Use LLM to create custom treatment plan"""
+    def generate_treatment(self, disease_name: str, doc: dict, confidence: float) -> str:
+        """Generate treatment plan using Groq"""
         
-        if not retrieved_docs:
-            return f"No information found for disease: {disease_name}"
+        # If Groq is not available, use template
+        if not self.groq_client:
+            return self._template_treatment(doc)
         
-        # Build context from retrieved documents
-        context = ""
-        for doc in retrieved_docs:
-            if isinstance(doc, dict):
-                d = doc['document']
-                context += f"""
-DISEASE: {d['disease_name']}
-CROP: {d['crop']}
-SEVERITY: {d['severity']}
-SYMPTOMS: {d['symptoms']}
-CHEMICAL: {d['chemical_control']}
-ORGANIC: {d['organic_control']}
-PREVENTION: {d['prevention']}
-CULTURAL: {d['cultural_practices']}
-URGENCY: {d['urgency']}
----
-"""
-            else:
-                d = doc
-                context += f"""
-DISEASE: {d['disease_name']}
-CROP: {d['crop']}
-SEVERITY: {d['severity']}
-CHEMICAL: {d['chemical_control']}
-ORGANIC: {d['organic_control']}
-PREVENTION: {d['prevention']}
----
-"""
-        
-        # If Groq is available, generate real LLM response
-        if self.groq_client:
+        try:
             prompt = f"""You are an expert agricultural advisor. Generate a COMPLETE TREATMENT PLAN for the disease below.
 
 DISEASE QUERY: {disease_name}
@@ -220,129 +184,74 @@ Make it practical, specific, and actionable for a farmer. Use bullet points.
 TREATMENT PLAN:
 """
             
-            try:
-                completion = self.groq_client.chat.completions.create(
-                    model="llama3-70b-8192",
-                    messages=[
-                        {"role": "system", "content": "You are an expert agricultural advisor. Provide detailed, practical treatment plans for farmers."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.4,
-                    max_tokens=1500
-                )
-                
-                llm_output = completion.choices[0].message.content
-                
-                # Add retrieval info
-                return f"""
-╔══════════════════════════════════════════════════════════════════╗
-║         🌾 LLM-GENERATED TREATMENT PLAN (Groq Llama 3) 🌾        ║
-║         Disease: {retrieved_docs[0]['document']['disease_name'] if isinstance(retrieved_docs[0], dict) else retrieved_docs[0]['disease_name']}                    
-╚══════════════════════════════════════════════════════════════════╝
-
-{llm_output}
-
-╔══════════════════════════════════════════════════════════════════╗
-║  📊 Retrieved from: {len(retrieved_docs)} disease record(s)                     ║
-║  🤖 Generated by: Groq Llama 3 70B                                        ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
-            except Exception as e:
-                print(f"Groq error: {e}")
-                return self._template_generation(disease_name, retrieved_docs)
-        
-        # Fallback to template generation
-        return self._template_generation(disease_name, retrieved_docs)
+            completion = self.groq_client.chat.completions.create(
+                model="llama3-70b-8192",
+                messages=[
+                    {"role": "system", "content": "You are an agricultural expert. Provide practical treatment plans."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1000
+            )
+            
+            return completion.choices[0].message.content
+            
+        except Exception as e:
+            print(f"Groq error: {e}")
+            return self._template_treatment(doc)
     
-    def _template_generation(self, disease_name: str, retrieved_docs: List) -> str:
-        """Template-based generation (fallback when LLM unavailable)"""
-        
-        doc = retrieved_docs[0]['document'] if isinstance(retrieved_docs[0], dict) else retrieved_docs[0]
-        
-        severity_icon = "🔴" if doc['severity'] in ["Critical", "High"] else "🟡" if doc['severity'] == "Medium" else "🟢"
-        
+    def _template_treatment(self, doc: dict) -> str:
+        """Template fallback"""
         return f"""
-{severity_icon}══════════════════════════════════════════════════════════════════{severity_icon}
-                    TREATMENT PLAN (Template Mode)
-                    {doc['disease_name'].upper()} on {doc['crop'].upper()}
-{severity_icon}══════════════════════════════════════════════════════════════════{severity_icon}
+╔══════════════════════════════════════════════════════════════╗
+║                    TREATMENT PLAN                            ║
+╚══════════════════════════════════════════════════════════════╝
 
-📋 DIAGNOSIS SUMMARY
-─────────────────────────────────────────────────────────────────
-Disease: {doc['disease_name']}
-Crop: {doc['crop']}
-Severity: {doc['severity']}
-Urgency: {doc['urgency']}
+DISEASE: {doc['disease_name']}
+CROP: {doc['crop']}
+SEVERITY: {doc['severity']}
+URGENCY: {doc['urgency']}
 
-Symptoms: {doc['symptoms']}
+SYMPTOMS:
+{doc['symptoms']}
 
-🚨 IMMEDIATE ACTION (Next 24 hours)
-─────────────────────────────────────────────────────────────────
-{doc['action_required']}
-
-💊 CHEMICAL TREATMENT
-─────────────────────────────────────────────────────────────────
+CHEMICAL TREATMENT:
 {doc['chemical_control']}
 
-🌱 ORGANIC ALTERNATIVES
-─────────────────────────────────────────────────────────────────
+ORGANIC TREATMENT:
 {doc['organic_control']}
 
-🛡️ PREVENTION STRATEGIES
-─────────────────────────────────────────────────────────────────
+PREVENTION:
 {doc['prevention']}
 
-🏡 CULTURAL PRACTICES
-─────────────────────────────────────────────────────────────────
+CULTURAL PRACTICES:
 {doc['cultural_practices']}
-
-⚠️ URGENCY LEVEL: {doc['urgency']}
-
-{severity_icon}══════════════════════════════════════════════════════════════════{severity_icon}
-💡 TIP: Add GROQ_API_KEY to Railway environment variables for AI-generated responses!
-{severity_icon}══════════════════════════════════════════════════════════════════{severity_icon}
 """
     
     def get_treatment(self, disease_name: str) -> dict:
-        """Main method: Retrieve + Generate"""
+        """Main method - get treatment plan"""
         
-        # Step 1: RETRIEVE relevant documents
-        retrieved = self.retrieve(disease_name, top_k=2)
+        doc, confidence = self.get_disease_by_name(disease_name)
         
-        if not retrieved:
+        if not doc:
             return {
                 "success": False,
-                "message": f"Disease '{disease_name}' not found",
-                "suggestions": self.get_suggestions(disease_name)
+                "error": f"Disease '{disease_name}' not found"
             }
         
-        # Step 2: GENERATE treatment plan
-        treatment_plan = self.generate_treatment(disease_name, retrieved)
-        
-        # Get primary document info
-        primary = retrieved[0]['document'] if isinstance(retrieved[0], dict) else retrieved[0]
+        # Generate treatment plan
+        treatment_plan = self.generate_treatment(disease_name, doc, confidence)
         
         return {
             "success": True,
-            "disease_name": primary['disease_name'],
-            "crop": primary['crop'],
-            "severity": primary['severity'],
-            "treatment_plan": treatment_plan,
-            "retrieved_confidence": retrieved[0]['similarity'] if isinstance(retrieved[0], dict) else 0.95
+            "disease_name": doc['disease_name'],
+            "crop": doc['crop'],
+            "severity": doc['severity'],
+            "confidence": confidence,
+            "treatment_plan": treatment_plan
         }
     
-    def get_suggestions(self, query: str, limit: int = 5) -> List[str]:
-        """Get disease suggestions"""
-        suggestions = []
-        for doc in self.documents:
-            if query.lower() in doc['disease_name'].lower() or query.lower() in doc['crop'].lower():
-                suggestions.append(doc['disease_code'])
-            if len(suggestions) >= limit:
-                break
-        return suggestions
-    
     def get_all_diseases(self) -> List[dict]:
-        """Get all disease codes and names"""
         return [
             {
                 "disease_code": doc['disease_code'],
@@ -355,11 +264,11 @@ Symptoms: {doc['symptoms']}
 
 # Initialize RAG
 print("="*50)
-print("Initializing REAL RAG with Generation...")
+print("Initializing RAG System...")
 print("="*50)
 rag = PlantDiseaseRAG()
-print(f"\n✅ Ready: {len(rag.documents) if rag.documents else 0} diseases loaded")
-print(f"✅ LLM Generation: {'ENABLED (Groq)' if rag.groq_client else 'DISABLED (template mode)'}")
+print(f"✅ Loaded {len(rag.documents)} diseases")
+print(f"✅ Groq: {'ENABLED' if rag.groq_client else 'DISABLED'}")
 print("="*50)
 
 # ============================================
@@ -372,45 +281,41 @@ class DiseaseRequest(BaseModel):
 @app.get("/")
 async def root():
     return {
-        "service": "Plant Disease RAG System - REAL Generation",
-        "description": "FAISS retrieval + Groq Llama 3 generation",
+        "service": "Plant Disease RAG API",
         "llm_enabled": rag.groq_client is not None,
-        "usage": {
-            "endpoint": "POST /treatment",
-            "body": {"disease_name": "Tomato___Late_blight"},
-            "response": "LLM-generated treatment plan"
-        }
+        "diseases_loaded": len(rag.documents)
     }
 
 @app.get("/health")
 async def health():
     return {
         "status": "healthy",
-        "diseases_loaded": len(rag.documents) if rag.documents else 0,
+        "diseases_loaded": len(rag.documents),
         "llm_enabled": rag.groq_client is not None
     }
 
 @app.get("/diseases")
 async def list_diseases():
-    diseases = rag.get_all_diseases()
-    return {"total": len(diseases), "diseases": diseases}
+    return {"total": len(rag.documents), "diseases": rag.get_all_diseases()}
 
 @app.post("/treatment")
-async def get_treatment(request: DiseaseRequest):
-    """Get LLM-generated treatment plan for a disease"""
-    result = rag.get_treatment(request.disease_name)
-    
-    if not result.get('success', False):
-        raise HTTPException(
-            status_code=404,
-            detail={
-                "message": result.get('message'),
-                "suggestions": result.get('suggestions', [])
-            }
-        )
-    
-    return result
+async def treatment(request: DiseaseRequest):
+    try:
+        result = rag.get_treatment(request.disease_name)
+        
+        if not result.get('success'):
+            raise HTTPException(status_code=404, detail=result.get('error'))
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
