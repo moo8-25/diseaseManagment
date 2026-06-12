@@ -1,22 +1,259 @@
 """
-Plant Disease RAG System - Railway Deployment
-Fixed JSON serialization issue
+REAL RAG System for Plant Disease Management
+- Multi-document retrieval with FAISS
+- LLM generation with Groq (Llama 3)
+- API key from environment variable (Railway)
 """
 
 import os
 import pandas as pd
 import numpy as np
-import faiss
+from typing import List, Dict
 from sentence_transformers import SentenceTransformer
-import pickle
+import faiss
+from groq import Groq
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-import uvicorn
-from datetime import datetime
 
-app = FastAPI(title="Plant Disease RAG API", version="1.0.0")
+# ============================================
+# REAL RAG SYSTEM
+# ============================================
+
+class RealPlantDiseaseRAG:
+    def __init__(self, csv_path: str = "disease_management.csv"):
+        """Initialize REAL RAG system"""
+        
+        print("="*50)
+        print("🚀 INITIALIZING REAL RAG SYSTEM")
+        print("="*50)
+        
+        # Load data
+        self.df = pd.read_csv(csv_path)
+        print(f"✅ Loaded {len(self.df)} disease records")
+        
+        # Embedding model
+        print("📦 Loading embedding model...")
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("✅ Embedding model loaded")
+        
+        # Prepare rich documents
+        self.documents = []
+        for _, row in self.df.iterrows():
+            rich_text = f"""
+            DISEASE INFORMATION
+            ===================
+            Disease Name: {row['disease_name']}
+            Crop: {row['crop']}
+            Severity: {row['severity']}
+            Status: {row['status']}
+            Urgency: {row['treatment_urgency']}
+            
+            SYMPTOMS:
+            {row['symptoms']}
+            
+            CHEMICAL CONTROL:
+            {row['chemical_control']}
+            
+            ORGANIC CONTROL:
+            {row['organic_control']}
+            
+            PREVENTION METHODS:
+            {row['prevention']}
+            
+            CULTURAL PRACTICES:
+            {row['cultural_practices']}
+            
+            ACTION REQUIRED:
+            {row['action_required']}
+            """
+            
+            self.documents.append({
+                "id": row['disease_code'],
+                "text": rich_text,
+                "metadata": {
+                    "disease_name": row['disease_name'],
+                    "crop": row['crop'],
+                    "severity": row['severity'],
+                    "chemical": row['chemical_control'],
+                    "organic": row['organic_control'],
+                    "prevention": row['prevention'],
+                    "cultural": row['cultural_practices'],
+                    "symptoms": row['symptoms'],
+                    "urgency": row['treatment_urgency']
+                }
+            })
+        
+        # Build FAISS index
+        print("🔍 Building FAISS index...")
+        texts = [doc['text'] for doc in self.documents]
+        embeddings = self.embedding_model.encode(texts)
+        embeddings = np.array(embeddings).astype('float32')
+        
+        self.index = faiss.IndexFlatL2(embeddings.shape[1])
+        self.index.add(embeddings)
+        print(f"✅ FAISS index built with {len(self.documents)} documents")
+        
+        # Initialize Groq client (READS FROM ENVIRONMENT VARIABLE)
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        
+        if groq_api_key:
+            print("✅ Groq API key found - LLM generation ENABLED")
+            self.groq_client = Groq(api_key=groq_api_key)
+            self.llm_enabled = True
+        else:
+            print("⚠️ GROQ_API_KEY not set - using template mode")
+            print("   Add GROQ_API_KEY to Railway environment variables")
+            self.llm_enabled = False
+            self.groq_client = None
+    
+    def retrieve(self, query: str, k: int = 3) -> List[Dict]:
+        """Retrieve top-k most relevant documents"""
+        
+        query_vec = self.embedding_model.encode([query])
+        query_vec = np.array(query_vec).astype('float32')
+        
+        distances, indices = self.index.search(query_vec, k)
+        
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx != -1:
+                similarity = 1 / (1 + distances[0][i])
+                results.append({
+                    "document": self.documents[idx],
+                    "similarity": float(similarity),
+                    "rank": i + 1
+                })
+        
+        return results
+    
+    def generate(self, query: str, retrieved_docs: List[Dict]) -> str:
+        """Generate response using Groq Llama 3.1 (if enabled)"""
+        
+        if not self.llm_enabled or not self.groq_client:
+            return self._fallback_generation(query, retrieved_docs)
+        
+        # Build context from retrieved documents
+        context = ""
+        for doc in retrieved_docs:
+            context += f"\n--- SOURCE {doc['rank']} (Relevance: {doc['similarity']:.2%}) ---\n"
+            context += doc['document']['text']
+            context += "\n"
+        
+        prompt = f"""You are an expert agricultural advisor with 20 years of experience. Use the retrieved information to answer the user's query.
+
+USER QUERY: {query}
+
+RETRIEVED INFORMATION:
+{context}
+
+INSTRUCTIONS:
+1. Synthesize information from ALL retrieved sources
+2. If information conflicts, explain the different approaches
+3. Provide a COMPLETE, ACTIONABLE response with:
+   - Quick diagnosis summary
+   - Immediate actions (first 24-48 hours)
+   - Chemical treatment options with specific products
+   - Organic/natural alternatives
+   - Prevention strategies
+   - When to call a professional
+4. Be specific: include product names, mixing ratios, application timing
+5. Use bullet points for clarity
+6. If the query is about a healthy plant, confirm and give maintenance tips
+
+RESPONSE:
+"""
+        
+        try:
+            completion = self.groq_client.chat.completions.create(
+                model="llama3-70b-8192",
+                messages=[
+                    {"role": "system", "content": "You are an expert agricultural advisor."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=1500
+            )
+            
+            return completion.choices[0].message.content
+            
+        except Exception as e:
+            return f"⚠️ LLM Error: {str(e)}\n\n{self._fallback_generation(query, retrieved_docs)}"
+    
+    def _fallback_generation(self, query: str, retrieved_docs: List[Dict]) -> str:
+        """Fallback when LLM unavailable"""
+        
+        if not retrieved_docs:
+            return f"No information found for: {query}"
+        
+        best = retrieved_docs[0]['document']
+        meta = best['metadata']
+        
+        return f"""
+╔══════════════════════════════════════════════════════════════╗
+║              PLANT DISEASE MANAGEMENT REPORT                 ║
+║                    (Template Mode)                           ║
+╚══════════════════════════════════════════════════════════════╝
+
+📋 DISEASE: {meta['disease_name']}
+🌾 CROP: {meta['crop']}
+⚠️  SEVERITY: {meta['severity']}
+⚡ URGENCY: {meta['urgency']}
+📊 CONFIDENCE: {retrieved_docs[0]['similarity']:.1%}
+
+🔬 SYMPTOMS:
+{meta['symptoms']}
+
+💊 CHEMICAL TREATMENT:
+{meta['chemical']}
+
+🌱 ORGANIC TREATMENT:
+{meta['organic']}
+
+🛡️ PREVENTION:
+{meta['prevention']}
+
+🏡 CULTURAL PRACTICES:
+{meta['cultural']}
+
+{'='*60}
+💡 TIP: Add GROQ_API_KEY to enable AI-powered responses!
+"""
+    
+    def chat(self, user_input: str) -> Dict:
+        """Complete RAG pipeline: Retrieve → Generate"""
+        
+        retrieved = self.retrieve(user_input, k=3)
+        
+        if not retrieved:
+            return {
+                "response": f"No relevant information found for: {user_input}",
+                "retrieved_docs": [],
+                "llm_enabled": self.llm_enabled
+            }
+        
+        response = self.generate(user_input, retrieved)
+        
+        return {
+            "response": response,
+            "retrieved_docs": [
+                {
+                    "disease": r['document']['metadata']['disease_name'],
+                    "crop": r['document']['metadata']['crop'],
+                    "similarity": r['similarity']
+                }
+                for r in retrieved
+            ],
+            "llm_enabled": self.llm_enabled
+        }
+
+
+# ============================================
+# FASTAPI APP
+# ============================================
+
+app = FastAPI(title="Real Plant Disease RAG API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,171 +263,59 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================
-# RAG SYSTEM
-# ============================================
-
-class PlantDiseaseRAG:
-    def __init__(self):
-        self.index = None
-        self.documents = None
-        self.embedding_model = None
-        self.load_or_build()
-    
-    def load_or_build(self):
-        """Load existing models or build from CSV"""
-        base_dir = os.path.dirname(__file__)
-        index_path = os.path.join(base_dir, "faiss_index.bin")
-        docs_path = os.path.join(base_dir, "documents.pkl")
-        csv_path = os.path.join(base_dir, "disease_management.csv")
-        
-        if os.path.exists(index_path) and os.path.exists(docs_path):
-            print("Loading existing models...")
-            self.index = faiss.read_index(index_path)
-            with open(docs_path, "rb") as f:
-                self.documents = pickle.load(f)
-            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-            print(f"✅ Loaded {len(self.documents)} diseases")
-        elif os.path.exists(csv_path):
-            print("Building from CSV...")
-            self.build_from_csv(csv_path)
-        else:
-            print(f"ERROR: No CSV found at {csv_path}")
-    
-    def build_from_csv(self, csv_path):
-        """Build FAISS index from CSV"""
-        print(f"Reading CSV from: {csv_path}")
-        self.df = pd.read_csv(csv_path)
-        print(f"Loaded {len(self.df)} rows")
-        
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        
-        # Prepare documents
-        self.documents = []
-        for _, row in self.df.iterrows():
-            doc = {
-                "disease_name": row['disease_name'],
-                "crop": row['crop'],
-                "chemical": row['chemical_control'],
-                "organic": row['organic_control'],
-                "prevention": row['prevention'],
-                "cultural": row['cultural_practices'],
-                "severity": row['severity'],
-                "urgency": row['treatment_urgency'],
-                "text": f"Disease: {row['disease_name']}. Chemical: {row['chemical_control']}. Organic: {row['organic_control']}"
-            }
-            self.documents.append(doc)
-        
-        # Build FAISS
-        texts = [doc['text'] for doc in self.documents]
-        embeddings = self.embedding_model.encode(texts)
-        embeddings = np.array(embeddings).astype('float32')
-        
-        self.index = faiss.IndexFlatL2(embeddings.shape[1])
-        self.index.add(embeddings)
-        
-        # Save models
-        faiss.write_index(self.index, os.path.join(os.path.dirname(csv_path), "faiss_index.bin"))
-        with open(os.path.join(os.path.dirname(csv_path), "documents.pkl"), "wb") as f:
-            pickle.dump(self.documents, f)
-        
-        print(f"✅ Built with {len(self.documents)} diseases")
-    
-    def query(self, disease_name: str) -> dict:
-        """Query the RAG system - returns JSON serializable types"""
-        if self.index is None:
-            return {"success": False, "message": "Models not loaded"}
-        
-        try:
-            # Embed query
-            query_vec = self.embedding_model.encode([disease_name])
-            query_vec = np.array(query_vec).astype('float32')
-            
-            # Search
-            distances, indices = self.index.search(query_vec, 1)
-            
-            if indices[0][0] == -1:
-                return {"success": False, "message": "No matching disease found"}
-            
-            # Convert numpy types to Python native types
-            similarity = float(1 / (1 + distances[0][0]))
-            disease = self.documents[indices[0][0]]
-            
-            return {
-                "success": True,
-                "confidence": similarity,
-                "disease_name": str(disease['disease_name']),
-                "crop": str(disease['crop']),
-                "severity": str(disease['severity']),
-                "urgency": str(disease['urgency']),
-                "chemical_control": str(disease['chemical']),
-                "organic_control": str(disease['organic']),
-                "prevention": str(disease['prevention']),
-                "cultural_practices": str(disease['cultural'])
-            }
-        except Exception as e:
-            return {"success": False, "message": f"Query error: {str(e)}"}
-    
-    def get_all_diseases(self) -> List[dict]:
-        """Get all diseases"""
-        if self.documents is None:
-            return []
-        return [
-            {
-                "disease_name": str(d['disease_name']),
-                "crop": str(d['crop']),
-                "severity": str(d['severity'])
-            } 
-            for d in self.documents
-        ]
-
 # Initialize RAG
-print("Initializing RAG system...")
-rag = PlantDiseaseRAG()
-print(f"RAG initialized: index={rag.index is not None}, docs={len(rag.documents) if rag.documents else 0}")
+print("\n" + "="*50)
+print("🔧 INITIALIZING RAG SYSTEM")
+print("="*50)
+rag = RealPlantDiseaseRAG()
+print("\n✅ API Ready!")
+print(f"   LLM Enabled: {rag.llm_enabled}")
+print("="*50 + "\n")
 
-# ============================================
-# API ENDPOINTS
-# ============================================
-
-class DiseaseQuery(BaseModel):
-    disease_name: str
+class ChatRequest(BaseModel):
+    message: str
 
 @app.get("/")
 async def root():
     return {
-        "service": "Plant Disease RAG System",
-        "status": "running",
-        "models_loaded": rag.index is not None,
-        "diseases_loaded": len(rag.documents) if rag.documents else 0
+        "service": "Real Plant Disease RAG System v2",
+        "llm_enabled": rag.llm_enabled,
+        "endpoints": {
+            "POST /chat": "Chat with AI",
+            "GET /health": "Health check",
+            "GET /diseases": "List all diseases",
+            "GET /status": "System status"
+        }
     }
 
 @app.get("/health")
 async def health():
     return {
         "status": "healthy",
-        "models_loaded": rag.index is not None,
-        "diseases_loaded": len(rag.documents) if rag.documents else 0,
-        "timestamp": datetime.now().isoformat()
+        "documents_loaded": len(rag.documents),
+        "llm_enabled": rag.llm_enabled
+    }
+
+@app.get("/status")
+async def status():
+    return {
+        "llm_enabled": rag.llm_enabled,
+        "total_diseases": len(rag.documents),
+        "message": "LLM generation is " + ("ENABLED" if rag.llm_enabled else "DISABLED - Add GROQ_API_KEY")
     }
 
 @app.get("/diseases")
-async def get_diseases():
-    diseases = rag.get_all_diseases()
+async def list_diseases():
+    diseases = [doc['metadata']['disease_name'] for doc in rag.documents]
     return {"total": len(diseases), "diseases": diseases}
 
-@app.post("/query")
-async def query_disease(query: DiseaseQuery):
-    result = rag.query(query.disease_name)
-    if not result.get('success', False):
-        raise HTTPException(status_code=404, detail=result.get('message', 'Disease not found'))
-    return result
-
-@app.get("/search")
-async def search(q: str):
-    diseases = rag.get_all_diseases()
-    matches = [d for d in diseases if q.lower() in d['disease_name'].lower()]
-    return {"query": q, "results": matches[:10], "count": len(matches)}
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    try:
+        result = rag.chat(request.message)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
